@@ -1,0 +1,15 @@
+streamlit
+python-dotenv
+pydantic
+langchain-classic
+langchain-core
+langchain-community
+langchain-google-genai
+wikipedia
+ddgs
+tenacity
+requests
+fpdf2
+supabase
+tavily-python
+langchain-groq
