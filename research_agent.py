@@ -1,10 +1,11 @@
 import os
 import re
+import json
 import concurrent.futures
 
 import requests
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,7 +18,15 @@ load_dotenv()
 
 class ResearchResponse(BaseModel):
     topic: str
-    summary: str
+    summary: str = Field(
+        description="A brief 2-4 sentence overview of the topic — just the headline "
+        "points, not the full detail. This is shown separately from full_report."
+    )
+    full_report: str = Field(
+        description="The complete, detailed research write-up covering all relevant "
+        "findings, context, and nuance gathered from the tools. This is the full answer "
+        "— summary is just a short teaser of it, not a substitute for it."
+    )
     sources: list[str]
     tools_used: list[str]
 
@@ -53,6 +62,23 @@ def _friendly_error(e: Exception) -> str:
         return (
             "🔑 Gemini API key was rejected. Double-check GOOGLE_API_KEY in your .env file "
             "(or Streamlit Cloud secrets) is correct and active."
+        )
+
+    if "UNAUTHENTICATED" in msg or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in msg:
+        return (
+            "🔑 Gemini rejected the request as unauthenticated — this specific error usually "
+            "means something is forcing OAuth/service-account auth instead of using your plain "
+            "API key. The most common cause: a GOOGLE_APPLICATION_CREDENTIALS environment "
+            "variable (often left over from unrelated Google Cloud SDK / gcloud setup) pointing "
+            "at a service-account JSON file, which takes priority over GOOGLE_API_KEY.\n\n"
+            "Fixes:\n"
+            "- Run `echo $GOOGLE_APPLICATION_CREDENTIALS` in your terminal — if it prints a "
+            "path, that's very likely the cause. Unset it with `unset GOOGLE_APPLICATION_CREDENTIALS` "
+            "before running the app, or remove it from your shell profile if it's set permanently.\n"
+            "- Confirm your GOOGLE_API_KEY in .env is a real AI Studio key (starts with 'AIza'), "
+            "generated at https://aistudio.google.com/apikey — not a Cloud Console OAuth client "
+            "ID/secret, which won't work here.\n"
+            "- Click '🔄 Rebuild agent' in the sidebar after fixing either of the above."
         )
 
     if _is_malformed_tool_call_error(e):
@@ -215,6 +241,21 @@ def build_agent_executor(verbose: bool = True, max_iterations: int = 3, callback
         raise MissingAPIKeyError(
             "No GOOGLE_API_KEY (or GEMINI_API_KEY) found. Set it in a .env file "
             "locally, or in Streamlit Cloud's Secrets manager when deployed."
+        )
+
+    # GOOGLE_APPLICATION_CREDENTIALS (a service-account JSON path, often left
+    # over from unrelated gcloud/Cloud SDK setup) takes priority over a plain
+    # API key in Google's underlying SDK and causes it to attempt OAuth/ADC
+    # auth instead — surfacing as "401 UNAUTHENTICATED... ACCESS_TOKEN_TYPE_
+    # UNSUPPORTED" even with a perfectly valid API key. Unset it just for this
+    # process so the API key path is used, without touching the real env var
+    # (which some other tool on the machine may still need).
+    _stale_adc_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+    if _stale_adc_creds:
+        import warnings
+        warnings.warn(
+            f"Ignored GOOGLE_APPLICATION_CREDENTIALS='{_stale_adc_creds}' for this "
+            "session — it was overriding the Gemini API key and causing auth failures."
         )
 
     llm = ChatGoogleGenerativeAI(
@@ -505,6 +546,134 @@ def run_research(
             "raw": raw_response,
             "used_fallback": used_fallback,
             "error": f"Error parsing response: {e}",
+        }
+
+
+def decompose_query(query: str, llm, num_subquestions: int = 4) -> list:
+    """
+    Breaks a broad research question into focused, non-overlapping
+    sub-questions using a lightweight, tool-free LLM call. Falls back to
+    treating the original query as a single sub-question if decomposition
+    fails for any reason (malformed JSON, empty response, etc) — deep
+    research should degrade to a normal single-pass run, not crash.
+    """
+    decompose_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                f"You are a research planning assistant. Break the user's question into "
+                f"{num_subquestions} focused, specific, non-overlapping sub-questions that "
+                "together would comprehensively answer it. Respond with ONLY a JSON array "
+                "of strings — no other text, no markdown fence.",
+            ),
+            ("human", "{query}"),
+        ]
+    )
+    try:
+        chain = decompose_prompt | llm
+        result = chain.invoke({"query": query})
+        text = getattr(result, "content", None) or str(result)
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return [query]
+        subs = json.loads(match.group(0))
+        subs = [s.strip() for s in subs if isinstance(s, str) and s.strip()]
+        return subs[:num_subquestions] if subs else [query]
+    except Exception:
+        return [query]  # degrade to a single-pass run rather than failing outright
+
+
+def run_deep_research(
+    query: str,
+    parser,
+    verbose: bool = True,
+    max_iterations: int = 5,
+    timeout_per_subquery: int = 60,
+    num_subquestions: int = 4,
+    progress_callback=None,
+):
+    """
+    Deep research mode: decomposes the query into sub-questions, researches
+    each independently (using the same loose, tool-free-of-JSON-constraint
+    prompt pattern proven in the fallback path — for the same reason: mixing
+    tool calls with a strict output format hurts reliability), then
+    synthesizes everything into one ResearchResponse via a separate,
+    tool-free reformatting call.
+
+    progress_callback, if given, is called with short status strings as each
+    stage completes (e.g. to write into a Streamlit st.status box).
+
+    Returns the same shape as run_research():
+    {"structured": ResearchResponse|None, "raw": dict|None, "used_fallback": None, "error": str|None}
+    """
+    api_key = get_api_key()
+    if not api_key:
+        raise MissingAPIKeyError(
+            "No GOOGLE_API_KEY (or GEMINI_API_KEY) found. Set it in a .env file "
+            "locally, or in Streamlit Cloud's Secrets manager when deployed."
+        )
+
+    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key, max_retries=3)
+    simple_prompt = _build_simple_prompt()
+    tools = [search_tool, wiki_tool, save_tool]
+    sub_executor = _build_executor_from_llm(llm, simple_prompt, tools, verbose, max_iterations, callbacks=None)
+    reformat_chain = _build_reformat_chain(llm, parser)
+
+    script_ctx = None
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        script_ctx = get_script_run_ctx()
+    except Exception:
+        pass
+
+    def _progress(msg):
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
+
+    _progress(f"🧩 Breaking question into up to {num_subquestions} sub-questions...")
+    sub_questions = decompose_query(query, llm, num_subquestions)
+
+    all_tools_used = []
+    findings_blocks = []
+    for i, subq in enumerate(sub_questions):
+        _progress(f"🔎 Researching sub-question {i + 1}/{len(sub_questions)}: {subq}")
+        try:
+            sub_raw = _invoke_with_timeout(
+                sub_executor, {"query": subq, "chat_history": []}, timeout_per_subquery, script_ctx
+            )
+            sub_text = _get_output_text(sub_raw)
+            for t in _get_actual_tools_used(sub_raw):
+                if t not in all_tools_used:
+                    all_tools_used.append(t)
+            findings_blocks.append(f"## {subq}\n\n{sub_text}")
+        except Exception as e:
+            findings_blocks.append(f"## {subq}\n\n[This sub-question could not be researched: {e}]")
+
+    combined_findings = f"Original question: {query}\n\n" + "\n\n".join(findings_blocks)
+
+    _progress("🧵 Synthesizing final report from all sub-questions...")
+    try:
+        reformat_result = reformat_chain.invoke({"raw_findings": combined_findings})
+        reformat_text = getattr(reformat_result, "content", None) or str(reformat_result)
+        json_text = _extract_json_block(reformat_text)
+        structured = parser.parse(json_text)
+        if all_tools_used:
+            structured.tools_used = all_tools_used
+        return {
+            "structured": structured,
+            "raw": {"output": [{"text": reformat_text}], "sub_questions": sub_questions},
+            "used_fallback": None,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "structured": None,
+            "raw": {"sub_questions": sub_questions, "combined_findings": combined_findings},
+            "used_fallback": None,
+            "error": f"Error synthesizing deep research report: {e}",
         }
 
 

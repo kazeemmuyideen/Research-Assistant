@@ -3,6 +3,7 @@ import streamlit as st
 from research_agent import (
     build_agent_executor,
     run_research,
+    run_deep_research,
     validate_sources,
     to_chat_messages,
     get_api_key,
@@ -48,6 +49,24 @@ with st.sidebar:
     debug_mode = st.checkbox("Debug mode (show raw agent output)", value=False)
     check_sources = st.checkbox("Validate source links", value=True)
     use_followups = st.checkbox("Multi-turn (use chat history as context)", value=False)
+
+    st.divider()
+    deep_research_mode = st.checkbox(
+        "🔬 Deep research mode",
+        value=False,
+        help="Breaks the question into several sub-questions, researches each "
+        "independently, then synthesizes one combined report. Slower and uses "
+        "more API calls than a normal run, but produces more thorough coverage "
+        "of broad topics.",
+    )
+    num_subquestions = 4
+    if deep_research_mode:
+        num_subquestions = st.slider("Number of sub-questions", 2, 6, 4)
+        st.caption(
+            f"Uses roughly {num_subquestions + 2} LLM calls per query "
+            "(decompose + each sub-question + synthesis) — budget your daily "
+            "quota accordingly."
+        )
 
     st.divider()
     st.caption(
@@ -121,6 +140,23 @@ def cached_run(query: str, max_iterations: int, timeout_seconds: int, chat_histo
     )
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_deep_run(query: str, num_subquestions: int, max_iterations: int, timeout_seconds: int):
+    parser = st.session_state.parser
+    # per-subquestion timeout — deep research does several sequential calls,
+    # so each one gets a share of the overall timeout budget rather than the
+    # full amount (otherwise total wait time could be timeout_seconds * N)
+    per_sub_timeout = max(30, timeout_seconds // 2)
+    return run_deep_research(
+        query,
+        parser,
+        verbose=verbose,
+        max_iterations=max_iterations,
+        timeout_per_subquery=per_sub_timeout,
+        num_subquestions=num_subquestions,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main UI
 # ---------------------------------------------------------------------------
@@ -169,49 +205,100 @@ if run_clicked:
         extra_context = st.session_state.get("extra_context_box", "").strip()
         effective_query = f"{query.strip()} (context: {extra_context})" if extra_context else query.strip()
 
-        status_box = st.status("Running agent...", expanded=True)
+        status_box = st.status(
+            "Running deep research..." if deep_research_mode else "Running agent...",
+            expanded=True,
+        )
         try:
-            chat_history = []
-            if use_followups:
-                from langchain_core.messages import HumanMessage, AIMessage
+            if deep_research_mode:
+                # Deep research runs several sequential sub-agent calls plus a
+                # synthesis step — live per-step streaming isn't wired through
+                # the cache boundary here (same simplification the normal
+                # cached_run already makes on a cache hit), so this just shows
+                # a static status while it works rather than granular steps.
+                status_box.write(
+                    f"Breaking the question into up to {num_subquestions} sub-questions, "
+                    "researching each, then synthesizing a combined report — this takes "
+                    "noticeably longer than a normal run."
+                )
+                result = cached_deep_run(effective_query, num_subquestions, max_iterations, timeout_seconds)
+                status_box.update(label="Done", state="complete", expanded=False)
 
-                for e in reversed(history_store.load_history(limit=6)):
-                    if e["summary"]:
-                        chat_history.append(HumanMessage(content=e["query"]))
-                        chat_history.append(AIMessage(content=e["summary"]))
+                if result.get("raw") and result["raw"].get("sub_questions"):
+                    with st.expander("🧩 Sub-questions researched", expanded=False):
+                        for sq in result["raw"]["sub_questions"]:
+                            st.markdown(f"- {sq}")
 
-            # Attach live-step streaming to the agent for this run. This is set
-            # on the session's executor instance directly (not inside the cached
-            # function) so the handler still fires even though the *result* gets
-            # cached — on a cache hit, no new agent call happens so no new steps
-            # will stream, which is expected: it means we skipped an API call.
-            step_handler = StreamlitStepHandler(status_box)
-            st.session_state.agent_executor.callbacks = [step_handler]
-            st.session_state["_pending_chat_history"] = chat_history
+                try:
+                    entry_id = history_store.save_entry(
+                        f"[Deep research] {effective_query}", result.get("structured"), result.get("error")
+                    )
+                except Exception:
+                    entry_id = None
 
-            result = cached_run(effective_query, max_iterations, timeout_seconds, chat_history_key=str(chat_history))
-            status_box.update(label="Done", state="complete", expanded=False)
+                if entry_id is not None:
+                    st.session_state.run_results[entry_id] = result
+                    st.session_state["latest_entry_id"] = entry_id
+                else:
+                    st.warning("Research completed, but couldn't save it to history right now.")
+                    if result.get("structured"):
+                        r = result["structured"]
+                        st.markdown(f"**Topic:** {r.topic}")
+                        st.markdown("**Summary:**")
+                        st.write(r.summary)
+                        if getattr(r, "full_report", None):
+                            st.markdown("**Full Report:**")
+                            st.write(r.full_report)
 
-            if result.get("used_fallback"):
-                st.info(f"ℹ️ Gemini was unavailable for this run — used {result['used_fallback']} instead.")
+                if result.get("error"):
+                    st.error(result["error"])
 
-            # Saving to history is a separate concern from the research run
-            # itself — if the store is briefly unreachable, don't make it
-            # look like the whole research run failed.
-            try:
-                entry_id = history_store.save_entry(effective_query, result.get("structured"), result.get("error"))
-            except Exception:
-                entry_id = None
-
-            if entry_id is not None:
-                st.session_state.run_results[entry_id] = result
-                st.session_state["latest_entry_id"] = entry_id
             else:
-                st.warning("Research completed, but couldn't save it to history right now.")
-                if result.get("structured"):
-                    r = result["structured"]
-                    st.markdown(f"**Topic:** {r.topic}")
-                    st.write(r.summary)
+                chat_history = []
+                if use_followups:
+                    from langchain_core.messages import HumanMessage, AIMessage
+
+                    for e in reversed(history_store.load_history(limit=6)):
+                        if e["summary"]:
+                            chat_history.append(HumanMessage(content=e["query"]))
+                            chat_history.append(AIMessage(content=e["summary"]))
+
+                # Attach live-step streaming to the agent for this run. This is set
+                # on the session's executor instance directly (not inside the cached
+                # function) so the handler still fires even though the *result* gets
+                # cached — on a cache hit, no new agent call happens so no new steps
+                # will stream, which is expected: it means we skipped an API call.
+                step_handler = StreamlitStepHandler(status_box)
+                st.session_state.agent_executor.callbacks = [step_handler]
+                st.session_state["_pending_chat_history"] = chat_history
+
+                result = cached_run(effective_query, max_iterations, timeout_seconds, chat_history_key=str(chat_history))
+                status_box.update(label="Done", state="complete", expanded=False)
+
+                if result.get("used_fallback"):
+                    st.info(f"ℹ️ Gemini was unavailable for this run — used {result['used_fallback']} instead.")
+
+                # Saving to history is a separate concern from the research run
+                # itself — if the store is briefly unreachable, don't make it
+                # look like the whole research run failed.
+                try:
+                    entry_id = history_store.save_entry(effective_query, result.get("structured"), result.get("error"))
+                except Exception:
+                    entry_id = None
+
+                if entry_id is not None:
+                    st.session_state.run_results[entry_id] = result
+                    st.session_state["latest_entry_id"] = entry_id
+                else:
+                    st.warning("Research completed, but couldn't save it to history right now.")
+                    if result.get("structured"):
+                        r = result["structured"]
+                        st.markdown(f"**Topic:** {r.topic}")
+                        st.markdown("**Summary:**")
+                        st.write(r.summary)
+                        if getattr(r, "full_report", None):
+                            st.markdown("**Full Report:**")
+                            st.write(r.full_report)
         except Exception as e:
             status_box.update(label="Failed", state="error")
             st.error(_friendly_error(e))
@@ -246,8 +333,13 @@ else:
                         st.json(live["raw"])
             else:
                 st.markdown(f"**Topic:** {row['topic']}")
+
                 st.markdown("**Summary:**")
                 st.code(row["summary"], language=None, wrap_lines=True)  # built-in copy button
+
+                if row.get("full_report"):
+                    st.markdown("**Full Report:**")
+                    st.code(row["full_report"], language=None, wrap_lines=True)  # built-in copy button
 
                 if row["sources"]:
                     st.markdown("**Sources:**")
@@ -268,13 +360,20 @@ else:
 
                 dl_col1, dl_col2, dl_col3 = st.columns(3)
                 with dl_col1:
+                    md_parts = [f"# {row['topic']}", "", "## Summary", row["summary"] or ""]
+                    if row.get("full_report"):
+                        md_parts += ["", "## Full Report", row["full_report"]]
+                    md_parts += [
+                        "",
+                        "## Sources",
+                        "\n".join(f"- {s}" for s in row["sources"]),
+                        "",
+                        "## Tools used",
+                        ", ".join(row["tools_used"]),
+                    ]
                     st.download_button(
                         "⬇️ Markdown",
-                        data=(
-                            f"# {row['topic']}\n\n{row['summary']}\n\n"
-                            f"## Sources\n" + "\n".join(f"- {s}" for s in row["sources"])
-                            + f"\n\n## Tools used\n{', '.join(row['tools_used'])}"
-                        ),
+                        data="\n".join(md_parts),
                         file_name=f"{(row['topic'] or 'research')[:40].strip().replace(' ', '_')}.md",
                         mime="text/markdown",
                         key=f"md_{row['id']}",
@@ -282,7 +381,11 @@ else:
                     )
                 with dl_col2:
                     pdf_bytes = build_research_pdf(
-                        row["topic"] or "Research", row["summary"], row["sources"], row["tools_used"]
+                        row["topic"] or "Research",
+                        row["summary"],
+                        row["sources"],
+                        row["tools_used"],
+                        full_report=row.get("full_report") or "",
                     )
                     st.download_button(
                         "⬇️ PDF",

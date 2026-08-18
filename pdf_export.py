@@ -28,7 +28,7 @@ def _ascii_safe(text: str) -> str:
     return text.encode("latin-1", errors="ignore").decode("latin-1")
 
 
-def build_research_pdf(topic: str, summary: str, sources: list, tools_used: list) -> bytes:
+def build_research_pdf(topic: str, summary: str, sources: list, tools_used: list, full_report: str = "") -> bytes:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -70,6 +70,12 @@ def build_research_pdf(topic: str, summary: str, sources: list, tools_used: list
     pdf.cell(0, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
     write_cell(summary, h=6, style="", size=11)
     pdf.ln(4)
+
+    if full_report and full_report.strip() != summary.strip():
+        set_font("B", 12)
+        pdf.cell(0, 8, "Full Report", new_x="LMARGIN", new_y="NEXT")
+        write_cell(full_report, h=6, style="", size=11)
+        pdf.ln(4)
 
     if sources:
         set_font("B", 12)

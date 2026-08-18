@@ -70,10 +70,14 @@ def _supabase_init_db():
     #   query text not null,
     #   topic text,
     #   summary text,
+    #   full_report text,
     #   sources jsonb,
     #   tools_used jsonb,
     #   error text
     # );
+    #
+    # If you already created the table before full_report existed, add it with:
+    #   alter table research_history add column if not exists full_report text;
     pass
 
 
@@ -83,6 +87,7 @@ def _supabase_save_entry(query, structured=None, error=None) -> int:
         "query": query,
         "topic": structured.topic if structured else None,
         "summary": structured.summary if structured else None,
+        "full_report": structured.full_report if structured else None,
         "sources": structured.sources if structured else None,
         "tools_used": structured.tools_used if structured else None,
         "error": error,
@@ -106,6 +111,7 @@ def _supabase_load_history(limit=50):
                 "query": row["query"],
                 "topic": row.get("topic"),
                 "summary": row.get("summary"),
+                "full_report": row.get("full_report"),
                 "sources": row.get("sources") or [],
                 "tools_used": row.get("tools_used") or [],
                 "error": row.get("error"),
@@ -141,12 +147,20 @@ def _sqlite_init_db():
                 query TEXT NOT NULL,
                 topic TEXT,
                 summary TEXT,
+                full_report TEXT,
                 sources TEXT,
                 tools_used TEXT,
                 error TEXT
             )
             """
         )
+        # Migration for databases created before full_report existed —
+        # CREATE TABLE IF NOT EXISTS won't retroactively add a column to an
+        # existing table, so add it explicitly and ignore if it's already there.
+        try:
+            conn.execute("ALTER TABLE research_history ADD COLUMN full_report TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
 
@@ -154,14 +168,15 @@ def _sqlite_save_entry(query, structured=None, error=None) -> int:
     with _sqlite_connect() as conn:
         cur = conn.execute(
             """
-            INSERT INTO research_history (timestamp, query, topic, summary, sources, tools_used, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO research_history (timestamp, query, topic, summary, full_report, sources, tools_used, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 datetime.now().isoformat(timespec="seconds"),
                 query,
                 structured.topic if structured else None,
                 structured.summary if structured else None,
+                structured.full_report if structured else None,
                 json.dumps(structured.sources) if structured else None,
                 json.dumps(structured.tools_used) if structured else None,
                 error,
@@ -185,6 +200,7 @@ def _sqlite_load_history(limit=50):
                 "query": row["query"],
                 "topic": row["topic"],
                 "summary": row["summary"],
+                "full_report": row["full_report"] if "full_report" in row.keys() else None,
                 "sources": json.loads(row["sources"]) if row["sources"] else [],
                 "tools_used": json.loads(row["tools_used"]) if row["tools_used"] else [],
                 "error": row["error"],
