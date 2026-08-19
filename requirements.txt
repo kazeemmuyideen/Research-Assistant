@@ -13,3 +13,4 @@ fpdf2
 supabase
 tavily-python
 langchain-groq
+python-docx

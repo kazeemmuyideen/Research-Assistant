@@ -20,12 +20,20 @@ class ResearchResponse(BaseModel):
     topic: str
     summary: str = Field(
         description="A brief 2-4 sentence overview of the topic — just the headline "
-        "points, not the full detail. This is shown separately from full_report."
+        "points, not the full detail. This is shown separately from full_report. "
+        "Plain prose, no headers needed at this length."
     )
     full_report: str = Field(
         description="The complete, detailed research write-up covering all relevant "
         "findings, context, and nuance gathered from the tools. This is the full answer "
-        "— summary is just a short teaser of it, not a substitute for it."
+        "— summary is just a short teaser of it, not a substitute for it. "
+        "Format this like a well-organized document, not one wall-of-text paragraph: "
+        "use markdown '## Section Header' lines to break it into logical sections "
+        "(e.g. Overview, Key Facts, History, Current State — whatever fits the topic), "
+        "use '- ' bullet points for lists of facts/items, and keep paragraphs short "
+        "(3-5 sentences). This will be rendered as formatted text and exported to Word/PDF, "
+        "so real structure matters — write it the way a well-edited report or Wikipedia "
+        "article is organized, not as a single unbroken block of text."
     )
     sources: list[str]
     tools_used: list[str]

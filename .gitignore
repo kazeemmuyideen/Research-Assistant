@@ -1,7 +1,5 @@
-venv/
 .env
+venv/
+research_history.db
 __pycache__/
 *.pyc
-*.db
-.claude/
-.agents/

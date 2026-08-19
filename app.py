@@ -14,6 +14,7 @@ from research_agent import (
 )
 from streamlit_callbacks import StreamlitStepHandler
 from pdf_export import build_research_pdf
+from docx_export import build_research_docx
 import history_store
 
 st.set_page_config(page_title="Research Assistant", page_icon="🔎", layout="wide")
@@ -245,10 +246,10 @@ if run_clicked:
                         r = result["structured"]
                         st.markdown(f"**Topic:** {r.topic}")
                         st.markdown("**Summary:**")
-                        st.write(r.summary)
+                        st.markdown(r.summary)
                         if getattr(r, "full_report", None):
                             st.markdown("**Full Report:**")
-                            st.write(r.full_report)
+                            st.markdown(r.full_report)
 
                 if result.get("error"):
                     st.error(result["error"])
@@ -295,10 +296,10 @@ if run_clicked:
                         r = result["structured"]
                         st.markdown(f"**Topic:** {r.topic}")
                         st.markdown("**Summary:**")
-                        st.write(r.summary)
+                        st.markdown(r.summary)
                         if getattr(r, "full_report", None):
                             st.markdown("**Full Report:**")
-                            st.write(r.full_report)
+                            st.markdown(r.full_report)
         except Exception as e:
             status_box.update(label="Failed", state="error")
             st.error(_friendly_error(e))
@@ -332,14 +333,20 @@ else:
                     if live and live.get("raw"):
                         st.json(live["raw"])
             else:
-                st.markdown(f"**Topic:** {row['topic']}")
+                st.markdown(f"## {row['topic']}")
 
-                st.markdown("**Summary:**")
-                st.code(row["summary"], language=None, wrap_lines=True)  # built-in copy button
+                st.markdown("**Summary**")
+                st.markdown(row["summary"])
 
                 if row.get("full_report"):
-                    st.markdown("**Full Report:**")
-                    st.code(row["full_report"], language=None, wrap_lines=True)  # built-in copy button
+                    st.markdown("**Full Report**")
+                    # Rendered as actual markdown (headers, bullets, bold) rather
+                    # than a plain-text box — this is what makes the model's
+                    # '## Section' / '- bullet' structure actually show up as
+                    # real formatting instead of literal characters.
+                    st.markdown(row["full_report"])
+                    with st.expander("📋 View as plain text (for copying)"):
+                        st.code(row["full_report"], language=None, wrap_lines=True)
 
                 if row["sources"]:
                     st.markdown("**Sources:**")
@@ -358,7 +365,7 @@ else:
                 if row["tools_used"]:
                     st.markdown("**Tools used:** " + ", ".join(row["tools_used"]))
 
-                dl_col1, dl_col2, dl_col3 = st.columns(3)
+                dl_col1, dl_col2, dl_col3, dl_col4 = st.columns(4)
                 with dl_col1:
                     md_parts = [f"# {row['topic']}", "", "## Summary", row["summary"] or ""]
                     if row.get("full_report"):
@@ -380,6 +387,22 @@ else:
                         use_container_width=True,
                     )
                 with dl_col2:
+                    docx_bytes = build_research_docx(
+                        row["topic"] or "Research",
+                        row["summary"],
+                        row["sources"],
+                        row["tools_used"],
+                        full_report=row.get("full_report") or "",
+                    )
+                    st.download_button(
+                        "⬇️ Word",
+                        data=docx_bytes,
+                        file_name=f"{(row['topic'] or 'research')[:40].strip().replace(' ', '_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"docx_{row['id']}",
+                        use_container_width=True,
+                    )
+                with dl_col3:
                     pdf_bytes = build_research_pdf(
                         row["topic"] or "Research",
                         row["summary"],
@@ -395,7 +418,7 @@ else:
                         key=f"pdf_{row['id']}",
                         use_container_width=True,
                     )
-                with dl_col3:
+                with dl_col4:
                     if st.button("🔁 Re-run this query", key=f"rerun_{row['id']}", use_container_width=True):
                         st.session_state.prefill_query = row["query"]
                         st.rerun()

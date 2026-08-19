@@ -1,4 +1,5 @@
 import os
+import re
 from fpdf import FPDF
 from fpdf.enums import WrapMode
 
@@ -63,18 +64,71 @@ def build_research_pdf(topic: str, summary: str, sources: list, tools_used: list
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, h, prep(text), wrapmode=WrapMode.CHAR, new_x="LMARGIN", new_y="NEXT")
 
+    def write_structured_text(text):
+        """
+        Renders the model's lightweight markdown ('## Header', '- bullet',
+        '1. numbered', blank-line paragraphs) as actual visual structure —
+        bold/larger headers, indented bullet lines — instead of printing
+        literal '##' and '-' characters on the page.
+        """
+        if not text:
+            return
+        paragraph_buffer = []
+
+        def flush():
+            if paragraph_buffer:
+                write_cell(" ".join(paragraph_buffer).strip(), h=6, style="", size=11)
+                pdf.ln(1)
+                paragraph_buffer.clear()
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                flush()
+                continue
+
+            header_match = re.match(r"^(#{1,4})\s+(.*)", line)
+            if header_match:
+                flush()
+                level = len(header_match.group(1))
+                size = {1: 14, 2: 13, 3: 12}.get(level, 11)
+                write_cell(header_match.group(2).strip(), h=7, style="B", size=size)
+                continue
+
+            bullet_match = re.match(r"^[-*]\s+(.*)", line)
+            if bullet_match:
+                flush()
+                write_cell(f"  •  {bullet_match.group(1).strip()}", h=6, style="", size=11)
+                continue
+
+            numbered_match = re.match(r"^(\d+)[.)]\s+(.*)", line)
+            if numbered_match:
+                flush()
+                write_cell(f"  {numbered_match.group(1)}.  {numbered_match.group(2).strip()}", h=6, style="", size=11)
+                continue
+
+            bold_header_match = re.match(r"^\*\*(.+)\*\*$", line)
+            if bold_header_match:
+                flush()
+                write_cell(bold_header_match.group(1).strip(), h=6, style="B", size=11)
+                continue
+
+            paragraph_buffer.append(line)
+
+        flush()
+
     write_cell(topic, h=10, style="B", size=16)
     pdf.ln(2)
 
     set_font("B", 12)
     pdf.cell(0, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
-    write_cell(summary, h=6, style="", size=11)
+    write_structured_text(summary)
     pdf.ln(4)
 
     if full_report and full_report.strip() != summary.strip():
         set_font("B", 12)
         pdf.cell(0, 8, "Full Report", new_x="LMARGIN", new_y="NEXT")
-        write_cell(full_report, h=6, style="", size=11)
+        write_structured_text(full_report)
         pdf.ln(4)
 
     if sources:
