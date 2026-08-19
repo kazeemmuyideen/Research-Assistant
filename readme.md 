@@ -1,0 +1,370 @@
+# Research Assistant
+
+A Streamlit-based AI research agent. Given a question, it searches the web and Wikipedia,
+synthesizes a structured report (topic, summary, full report, sources, tools used), and lets
+you export it as Markdown, Word, or PDF. Built on LangChain with Google Gemini as the primary
+model and an automatic Groq fallback chain for resilience.
+
+---
+
+## Table of Contents
+
+- [How a Query Actually Runs](#how-a-query-actually-runs)
+- [File-by-File Breakdown](#file-by-file-breakdown)
+  - [`app.py`](#apppy)
+  - [`research_agent.py`](#research_agentpy)
+  - [`tools.py`](#toolspy)
+  - [`history_store.py`](#history_storepy)
+  - [`pdf_export.py`](#pdf_exportpy)
+  - [`docx_export.py`](#docx_exportpy)
+  - [`streamlit_callbacks.py`](#streamlit_callbackspy)
+- [Key Design Decisions (the "why")](#key-design-decisions-the-why)
+- [Setup](#setup)
+- [Environment Variables](#environment-variables)
+- [Known Limitations](#known-limitations)
+
+---
+
+## How a Query Actually Runs
+
+This is the full path a query takes, end to end, in the **normal (non-deep-research) case**:
+
+1. **You type a question** in the text box. Optionally, you add disambiguating context
+   (e.g. "Nigerian software developer, based in Lagos") in the collapsible section below it —
+   this gets folded directly into the query text sent to the agent.
+2. **`run_research()`** (in `research_agent.py`) is called with your query, the primary Gemini
+   agent, and the list of Groq fallback agents.
+3. The agent (a LangChain `AgentExecutor`) runs in a **background thread with a hard timeout**.
+   It can call three tools — `search`, `wikipedia`, `save_text_to_file` — as many times as
+   needed (up to "Max agent iterations"), then produces a final answer formatted as JSON
+   matching the `ResearchResponse` schema.
+4. **If Gemini fails** with a quota/rate-limit error, the app automatically retries the *same
+   query* on each Groq fallback model in sequence, using a **two-stage process** (research in
+   plain text first, then a separate call reformats that text into the JSON schema — see
+   [Key Design Decisions](#key-design-decisions-the-why) for why this is split into two steps).
+5. **The JSON response is parsed** into a `ResearchResponse` object. The `tools_used` field is
+   then **overridden** with the tools that *actually* ran (read from the agent's own execution
+   log), rather than trusting whatever the model claims it used.
+6. **The result is saved** to history (Supabase or local SQLite, whichever is configured) and
+   displayed in the UI, rendered as real Markdown — headers, bullets, and bold all show up as
+   actual formatting, not literal `##`/`-` characters.
+7. **You can export** the result as Markdown, Word (`.docx`), or PDF — all three parse the same
+   markdown structure into real headings/bullets in their respective formats.
+
+**Deep research mode** (optional, toggled in the sidebar) changes step 3: instead of one agent
+call, the query is first broken into 2–6 sub-questions, each is researched independently in
+plain text (no JSON pressure), and all findings are combined and sent through one final
+synthesis call that produces the structured `ResearchResponse`. This produces more thorough
+coverage of broad topics at the cost of ~6+ LLM calls instead of 1.
+
+---
+
+## File-by-File Breakdown
+
+### `app.py`
+
+The Streamlit UI. Everything the user sees and clicks lives here. Contains no research logic
+itself — it calls into `research_agent.py` and displays the results.
+
+**Startup sequence (runs on every script rerun, top to bottom):**
+1. `history_store.init_db()` — creates the history table/database if it doesn't exist yet.
+2. **Password gate** — if `APP_PASSWORD` is set in the environment, the whole app is hidden
+   behind a password box until the correct password is entered (stored in
+   `st.session_state.authenticated` so you don't have to re-enter it every rerun).
+3. **Sidebar settings** are rendered: max agent iterations, timeout, verbose logging, debug
+   mode, source-link validation, multi-turn toggle, deep research toggle + sub-question count,
+   and status captions showing which fallback LLM / storage backend is active.
+4. **Agent build** — `build_agent_executor()` is called *once* per session and cached in
+   `st.session_state.agent_executor` / `.parser` / `.fallback_executors`. The "🔄 Rebuild agent"
+   button clears these so they get rebuilt (needed after changing `.env` values, since
+   Streamlit doesn't reload environment variables mid-session).
+
+**Caching:**
+- `cached_run()` wraps `run_research()` with `@st.cache_data(ttl=3600)` — an identical query
+  with identical settings within an hour returns the cached result instead of spending another
+  API call. This is why the "used_fallback" notice and live step-streaming don't reappear on a
+  cache hit — no new agent call happened.
+- `cached_deep_run()` does the same for deep research mode.
+
+**Query submission flow (`if run_clicked:`):**
+- Builds `effective_query` by appending any optional context you typed.
+- Branches on `deep_research_mode`:
+  - **Deep research**: calls `cached_deep_run()`, shows which sub-questions were researched
+    in an expander, saves to history with a `[Deep research]` prefix on the query text.
+  - **Normal**: attaches a `StreamlitStepHandler` to the agent so tool-call steps stream live
+    into the status box, calls `cached_run()`, shows a notice if a Groq fallback answered
+    instead of Gemini, then saves to history.
+- Both branches save-then-display defensively: if saving to history fails (e.g. Supabase is
+  briefly unreachable), the result is still shown directly rather than being lost.
+
+**Results section:**
+- Reads the last 25 entries from `history_store.load_history()` — this is the source of truth
+  for what's displayed, not `st.session_state`, so results survive page reloads and browser
+  restarts.
+- Each entry renders as an expander showing topic, summary, full report (as real Markdown, with
+  a "view as plain text" fallback for copying), sources (with reachability icons — ✅ reachable,
+  ⚠️ unreachable, ❔ no URL to check), tools used, and four action buttons: Markdown download,
+  Word download, PDF download, and re-run (which copies the query back into the input box).
+- A delete button per entry, plus a "clear all history" button in the sidebar.
+
+---
+
+### `research_agent.py`
+
+All the actual research/LLM logic. No Streamlit UI code (aside from optional soft integration
+points like reading `st.secrets` and attaching to `st.status` for live updates).
+
+**`ResearchResponse` (Pydantic model)** — the structured output schema every agent run must
+produce: `topic`, `summary` (brief), `full_report` (detailed, explicitly instructed to use
+markdown headers/bullets), `sources`, `tools_used`. Because the JSON instructions sent to the
+model are auto-generated from this schema (`parser.get_format_instructions()`), changing a
+field's description here changes what the model is told to do everywhere — primary agent,
+fallback agents, and deep research synthesis — without touching any prompt separately.
+
+**Credential helpers** (`get_api_key`, `get_groq_api_key`, `get_app_password`) — each checks
+environment variables first, then `st.secrets` (for Streamlit Cloud deployment), so the same
+code works identically locally (`.env`) and deployed (Secrets manager).
+
+**`build_agent_executor(verbose, max_iterations, callbacks)`** — the main setup function, called
+once per session by `app.py`. Returns `(agent_executor, parser, fallback_executors)`:
+- Builds the primary Gemini agent using the strict prompt (tools + JSON format required
+  together).
+- Proactively removes `GOOGLE_APPLICATION_CREDENTIALS` from the environment before creating the
+  Gemini client — this variable (often left over from unrelated `gcloud` setup) silently forces
+  OAuth authentication instead of the plain API key, causing a confusing
+  `401 UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED` error.
+- If `GROQ_API_KEY` is set, builds a **list** of fallback agents (default: `llama-3.3-70b-versatile`,
+  `llama-3.1-8b-instant`, `openai/gpt-oss-120b`, overridable via `GROQ_FALLBACK_MODELS`). Each
+  fallback is actually a *pair*: a tool-using "search executor" (loose prompt, no JSON
+  requirement) and a separate tool-free "reformat chain" (see below for why).
+
+**`run_research(query, agent_executor, parser, chat_history, timeout_seconds, fallback_executors)`**
+— runs one query end to end:
+1. Invokes the primary agent in a background thread with a hard timeout
+   (`_invoke_with_timeout`), so a hung request can't freeze the whole app.
+2. On timeout: returns a message that distinguishes "this might just need more time / a
+   narrower query" from "this is a private individual with thin web presence — no timeout fixes
+   that."
+3. On any other exception: if it's a quota/rate-limit error (`_is_quota_or_rate_error`) and
+   fallback agents exist, tries each fallback in order using the **two-stage process**:
+   - Stage 1: the fallback's search executor researches the query and answers in plain text
+     (no JSON constraint).
+   - Stage 2: that plain text is sent through the fallback's tool-free reformat chain, which
+     converts it into the strict JSON schema.
+   - If a fallback fails at either stage, the next fallback in the list is tried.
+4. If parsing succeeds, `tools_used` is overridden with the *actual* tools read from
+   `intermediate_steps` (the agent's real execution log) rather than what the model self-reports
+   — this prevents hallucinations like listing "NumPy, Django, TensorFlow" as tools when asked
+   about Python, when the agent actually just called `search` and `wikipedia`.
+
+**`decompose_query(query, llm, num_subquestions)`** — one lightweight, tool-free LLM call that
+breaks a broad query into focused sub-questions (returns JSON array of strings). Falls back to
+treating the original query as a single sub-question if the model's response can't be parsed.
+
+**`run_deep_research(query, parser, ...)`** — the deep research entry point:
+1. Builds a fresh Gemini client, a loose-prompt tool-using agent, and a reformat chain
+   (independent of the session's cached primary agent).
+2. Decomposes the query via `decompose_query()`.
+3. Researches each sub-question independently (plain text, tools allowed, no JSON pressure),
+   collecting real tool usage from each sub-run.
+4. Concatenates all sub-question findings into one block of text.
+5. Sends that combined text through the reformat chain to produce one final structured
+   `ResearchResponse`, with `tools_used` set from the aggregated real tool-call log across all
+   sub-questions.
+
+**`validate_sources(sources, timeout)`** — checks each source string for reachability. Matches
+full `https://` URLs directly; for bare domain mentions without a scheme (e.g. `"python.org"`),
+detects the domain pattern and prepends `https://` before checking. Returns `True`/`False`/`None`
+(reachable / unreachable / not a URL at all) per source.
+
+**Error handling (`_friendly_error`)** — translates known Gemini/Groq failure signatures into
+plain-English, actionable messages instead of raw API error dumps:
+- Daily free-tier quota exhausted (20 req/day) → explains why, offers concrete next steps.
+- Generic rate limiting → "try again in a minute."
+- Invalid API key → check `.env`.
+- `UNAUTHENTICATED` / `ACCESS_TOKEN_TYPE_UNSUPPORTED` → walks through the
+  `GOOGLE_APPLICATION_CREDENTIALS` diagnosis.
+- Malformed tool call (Groq/Llama quirk) → explains it's a known small-model limitation, not a
+  bug in the query.
+
+---
+
+### `tools.py`
+
+Defines the three tools the agent can call.
+
+- **`search_tool`** — uses **Tavily** (a licensed search API built for LLM agents) if
+  `TAVILY_API_KEY` is set. Otherwise falls back to `DuckDuckGoSearchRun` (via the `ddgs`
+  library) automatically, so nothing breaks without a Tavily key — but DuckDuckGo's scraping
+  approach isn't licensed for commercial/automated use, so Tavily is the intended production
+  backend. Wrapped in `safe_search()`, which retries transient failures up to 3 times with
+  exponential backoff before giving up gracefully (returns a message telling the agent to try
+  Wikipedia instead, rather than crashing the whole run).
+- **`wiki_tool`** — `WikipediaQueryRun` via `WikipediaAPIWrapper`, capped at 1 result and 500
+  characters of content per query to keep responses concise.
+- **`save_tool`** — appends timestamped research output to a local `research_output.txt` file.
+  Available to the agent but rarely triggered in normal use.
+
+---
+
+### `history_store.py`
+
+Persistent storage for past research results, with **automatic backend selection**:
+
+- If `SUPABASE_URL` and a Supabase key (`SUPABASE_KEY` / `SUPABASE_ANON_KEY` /
+  `SUPABASE_SERVICE_KEY`) are set, uses Supabase (Postgres) — shared across devices/sessions,
+  survives redeploys.
+- Otherwise, falls back to a local SQLite file (`research_history.db`, created next to the
+  script) — works out of the box with zero setup, but is device-local and gets wiped on
+  Streamlit Cloud redeploys.
+
+Both backends expose the identical public interface (`init_db`, `save_entry`, `load_history`,
+`clear_history`, `delete_entry`, `backend_name`) — `app.py` never needs to know which one is
+active.
+
+- **Supabase calls are retried** (`_supabase_call`, 3 attempts with backoff) to survive
+  transient network drops, and return `None`/`[]` rather than raising if still unreachable
+  after retries — a Supabase hiccup degrades to a warning banner in the UI, not a crash.
+- **SQLite has an automatic migration**: `_sqlite_init_db()` runs `CREATE TABLE IF NOT EXISTS`
+  for new installs, then separately attempts `ALTER TABLE ... ADD COLUMN full_report TEXT`
+  wrapped in a try/except — this safely adds the column to databases created before
+  `full_report` existed, without losing any existing data.
+- **Supabase requires one manual step** the Python client can't do itself: creating the table
+  (and later, adding the `full_report` column) via the Supabase SQL editor. The exact SQL is
+  in a comment inside `_supabase_init_db()`.
+
+---
+
+### `pdf_export.py`
+
+Builds a PDF from a research result using `fpdf2`.
+
+- **Unicode font handling**: searches common system paths for DejaVu Sans (bundled with most
+  Linux distros). If found, uses it so non-Latin text (Arabic, Cyrillic, etc.) renders instead
+  of crashing. If not found, falls back to stripping unsupported characters and adds a small
+  note at the bottom of the PDF explaining why.
+- **`write_cell()`**: a wrapper around `multi_cell` that (a) uses character-level line wrapping
+  so a long unbroken string like a URL never raises fpdf2's "not enough horizontal space"
+  error, and (b) explicitly resets the cursor to the left margin before writing — without this,
+  a prior `multi_cell` call can leave the cursor near the page's right edge, which combined with
+  character-wrapping causes an infinite loop trying to fit a character into ~0mm of space.
+- **`write_structured_text()`**: parses the model's markdown output (`## headers`, `- bullets`,
+  `1. numbered lists`, `**bold**` sub-headers) into actual visual formatting — larger/bold text
+  for headers, `•` prefixes for bullets — instead of printing literal `##`/`-` characters on
+  the page.
+
+---
+
+### `docx_export.py`
+
+Builds a real Word document using `python-docx`.
+
+- **`_add_structured_text()`**: the same markdown-parsing logic as the PDF exporter, but
+  producing genuine Word elements instead of visual approximations — actual `Heading 1`–`4`
+  paragraph styles, `List Bullet` / `List Number` styles, and bold text runs. This means the
+  resulting `.docx` has real document structure: opening it in Word and using the navigation
+  pane / table-of-contents features actually works, because the headings are real heading
+  styles, not just bold text that happens to look like one.
+- Document layout: title (Heading 0) → Summary (Heading 1 + body) → Full Report (Heading 1 +
+  parsed structure) → Sources (bulleted list) → Tools Used (paragraph).
+
+---
+
+### `streamlit_callbacks.py`
+
+`StreamlitStepHandler` — a LangChain callback handler that writes short status lines (e.g. "🔧
+Using **search**...", "💭 Thinking...") into a Streamlit `st.status` box as the agent works, so
+you see live progress instead of a blank spinner during a normal (non-deep-research) run.
+Requires the Streamlit script-run context to be explicitly attached to the background thread the
+agent runs in (`add_script_run_ctx` in `research_agent.py`) — without that, these callbacks fail
+silently with a `NoSessionContext` error, since Streamlit widgets don't know which page/session
+they belong to when called from an arbitrary thread.
+
+---
+
+## Key Design Decisions (the "why")
+
+**Why is the Groq fallback split into two separate calls (research, then reformat) instead of
+one combined call like the primary Gemini agent?**
+Smaller/faster models (Groq's Llama family) are noticeably less reliable at *simultaneously*
+calling tools correctly **and** hitting an exact JSON schema in the same turn — this produced
+recurring "malformed tool call" errors. Splitting the work into two single-purpose calls (research
+freely in plain text, then separately reformat that text into JSON with no tools in scope at all)
+removes the competition between those two jobs and fixed the failure mode at its root, rather than
+just retrying the same fragile combined call.
+
+**Why are fallback agents a list of separate `AgentExecutor` objects instead of using LangChain's
+`.with_fallbacks()`?**
+`create_tool_calling_agent()` calls `.bind_tools()` internally, which `RunnableWithFallbacks`
+doesn't support cleanly — using it would have silently broken tool calling rather than actually
+providing a working fallback. Building fully separate executors is more code, but is the version
+that's actually reliable.
+
+**Why override `tools_used` after parsing instead of trusting the model's own JSON field?**
+Models can hallucinate what "tools" means contextually (e.g. listing Python libraries as tools
+when asked about Python) instead of reporting which of the three real tools (search/wikipedia/save)
+it actually invoked. Reading the agent's own execution log (`intermediate_steps`) is a
+deterministic source of truth that doesn't depend on the model accurately self-reporting.
+
+**Why does the storage layer auto-detect Supabase vs. SQLite instead of requiring a config flag?**
+So the same code works immediately for local development (zero setup — SQLite just works) and
+for production/multi-device use (set two environment variables, no code change) — the presence
+of `SUPABASE_URL`/`SUPABASE_KEY` alone determines behavior.
+
+**Why is deep research mode a separate function (`run_deep_research`) rather than a parameter on
+`run_research`?**
+The two have fundamentally different call shapes — one LLM call vs. many sequential ones with a
+synthesis step at the end — and conflating them into one function with branching logic would have
+made both harder to reason about and test independently.
+
+---
+
+## Setup
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the same folder (see [Environment Variables](#environment-variables)
+below), then:
+
+```bash
+streamlit run app.py
+```
+
+---
+
+## Environment Variables
+
+| Variable | Required? | Purpose |
+|---|---|---|
+| `GOOGLE_API_KEY` | **Yes** | Gemini API key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Must start with `AIza` — a Cloud Console OAuth client ID/secret will *not* work here. |
+| `GROQ_API_KEY` | No | Enables automatic fallback if Gemini's quota/rate limit is hit. Free key at [console.groq.com](https://console.groq.com). |
+| `GROQ_FALLBACK_MODELS` | No | Comma-separated override of which Groq models to try, in order. Default: `llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-120b`. |
+| `TAVILY_API_KEY` | No | Licensed search backend. Without it, falls back to DuckDuckGo scraping (fine for personal use, not licensed for commercial use). Free key at [tavily.com](https://tavily.com). |
+| `SUPABASE_URL` / `SUPABASE_KEY` | No | Enables Supabase-backed history storage instead of local SQLite. Both must be set together. |
+| `APP_PASSWORD` | No | If set, gates the entire app behind a password prompt — useful before deploying publicly. |
+
+`GOOGLE_APPLICATION_CREDENTIALS`, if present in your shell environment from unrelated Google
+Cloud SDK setup, is automatically ignored by this app (see `build_agent_executor()` in
+`research_agent.py`) since it otherwise breaks Gemini authentication.
+
+---
+
+## Known Limitations
+
+- **Gemini free tier caps at 20 requests/day** for the model used here. Deep research mode alone
+  can use ~6+ requests per query. The Groq fallback and result caching (1-hour TTL on identical
+  queries) both help stretch this, but heavy use requires enabling billing.
+- **DuckDuckGo fallback search isn't licensed for commercial/automated use** — set
+  `TAVILY_API_KEY` before relying on this for anything beyond personal use.
+- **Search results are limited by what's actually indexed online.** For private individuals with
+  common names and little web presence, no amount of timeout/iteration tuning will produce a
+  confident answer — this is a fundamental limit of web search, not a bug.
+- **Live step-by-step streaming doesn't show during deep research mode** — you get a static
+  "working on it" message instead of granular tool-call updates, since deep research involves
+  several sequential background calls rather than one streamed session.
+- **SQLite history is device-local** and gets wiped on Streamlit Cloud redeploys — use Supabase
+  for anything you need to persist across deployments or access from multiple devices.
